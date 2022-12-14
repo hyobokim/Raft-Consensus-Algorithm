@@ -17,6 +17,7 @@ class Replica:
         self.socket.setblocking(0)
 
         self.dictionary = {}
+        self.prev_log_index = 0
 
         # ADDITIONAL VAR
         self.term = 0
@@ -32,18 +33,28 @@ class Replica:
         print("Sent hello message: %s" % hello, flush=True)
 
     def get(self, msg):
-        value = ''
-        if msg['key'] in self.dictionary:
-            value = self.dictionary[msg['key']]
-        req = {
-            'src': self.id,
-            'dst': msg['src'],
-            'leader': self.leader,
-            'type': 'ok',
-            'value': value,
-            'MID': msg['MID']
-        }
-        self.send(req)
+        if self.state != "LEADER":
+            redirect = {
+                'src': self.id,
+                'dst': msg['src'],
+                'leader': self.leader,
+                'type': 'redirect',
+                'MID': msg['MID']
+            }
+            self.send(redirect)
+        elif self.state == "LEADER":
+            value = ''
+            if msg['key'] in self.dictionary:
+                value = self.dictionary[msg['key']]
+            req = {
+                'src': self.id,
+                'dst': msg['src'],
+                'leader': self.leader,
+                'type': 'ok',
+                'value': value,
+                'MID': msg['MID']
+            }
+            self.send(req)
 
     def put(self, msg):
         if self.state != "LEADER":
