@@ -3,6 +3,7 @@
 import argparse, socket, time, json, select, struct, sys, math, os, random
 
 BROADCAST = "FFFF"
+queue = []
 
 class Replica:
     def __init__(self, port, id, others):
@@ -11,13 +12,15 @@ class Replica:
         self.others = others
         self.majority = math.ceil(len(others)/2)
         self.vote_count = 0
+        self.commit_votes = 0
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('localhost', 0))
         self.socket.setblocking(0)
 
         self.dictionary = {}
-        self.prev_log_index = 0
+        self.history = {-1: ""}
+        self.prev_log_index = -1
 
         # ADDITIONAL VAR
         self.term = 0
@@ -67,31 +70,137 @@ class Replica:
             }
             self.send(redirect)
         elif self.state == "LEADER":
-            # naive implementation
-            # just sending an ok without checking with the replicas
-            ok_msg = {
-                'src': self.id,
-                'dst': msg['src'],
-                'leader': self.leader,
-                'type': 'ok',
-                'MID': msg['MID']
-            }
-            # sending out append entries request to replicas
-            # doesn't do anything right now, have to implement later
-            for other in self.others:
-                if other == self.id:
-                    continue
-                req = {
+            if self.prev_log_index == -1 or not queue:
+                # send append entries request to replicas
+                self.request_append_entries(msg)
+                ok_msg = {
                     'src': self.id,
-                    'dst': other,
+                    'dst': msg['src'],
                     'leader': self.leader,
-                    'type': 'append_entries',
+                    'type': 'ok',
                     'MID': msg['MID']
                 }
-                self.send(req)
 
+                self.send(ok_msg)
+            else: # add the command to the queue, and wait for the current commit to finish
+                queue.append(msg)
+
+    def request_append_entries(self, msg):
+        # sending out append entries request to replicas
+        self.dictionary[msg['key']] = msg['value']
+        for other in self.others:
+            if other == self.id:
+                continue
+            req = {
+                'src': self.id,
+                'dst': other,
+                'leader': self.leader,
+                'type': 'append_entries',
+                'MID': msg['MID'],
+                'prevIndex': self.prev_log_index,
+                'prevValue': self.history[self.prev_log_index],
+                'key': msg['key'],
+                'value': msg['value'],
+            }
+            self.send(req)
+
+    def commit_put(self, msg):
+        # add the entry to dictionary log
+        if self.state != "LEADER":
+            self.prev_log_index += 1
             self.dictionary[msg['key']] = msg['value']
-            self.send(ok_msg)
+            self.history[self.prev_log_index] = self.term
+        else:
+            # someone just voted to commit, add that to commit votes
+            if self.prev_log_index == msg['prevIndex']: # if this is a commit from a previous vote, ignore
+                self.commit_votes += 1
+            else:
+                print("Commit limit already reached, ignoring this commit")
+
+            if self.commit_votes == self.majority:
+                self.commit_votes = 0
+                self.prev_log_index += 1
+                self.history[self.prev_log_index] = self.term
+                self.dictionary[msg['key']] = msg['value']
+
+                #send commit messages to all replicas
+                for other in self.others:
+                    if other == self.id:
+                        continue
+                    req = {
+                        'src': self.id,
+                        'dst': other,
+                        'leader': self.leader,
+                        'type': 'commit',
+                        'MID': msg['MID'],
+                        'key': msg['key'],
+                        'value': msg['value']
+                    }
+                    self.send(req)
+
+                # send an ok message
+                ok_msg = {
+                    'src': self.id,
+                    'dst': msg['src'],
+                    'leader': self.leader,
+                    'type': 'ok',
+                    'MID': msg['MID']
+                }
+                self.send(ok_msg)
+
+                # continue with the next command
+                if queue:
+                    next_command = queue.pop()
+                    self.request_append_entries(next_command)
+
+
+
+    def append_entries(self, msg):
+        # this is only sent from the leader to followers, therefore no need to check
+        # if leader or not
+
+        if self.prev_log_index == -1:
+            # automatically accept, this is the first entry in the log
+            print("ACCEPTING")
+            commit_msg = {
+                'src': self.id,
+                'dst': self.leader,
+                'leader': self.leader,
+                'type': 'commit',
+                'MID': msg['MID'],
+                'key': msg['key'],
+                'value': msg['value'],
+                'prevIndex': msg['prevIndex']
+            }
+            self.send(commit_msg)
+        else:
+            # check if the log matches
+            if self.prev_log_index == msg['prevIndex'] and self.history[self.prev_log_index] == msg['prevValue']:
+                # accept
+                commit_msg = {
+                    'src': self.id,
+                    'dst': self.leader,
+                    'leader': self.leader,
+                    'type': 'commit',
+                    'MID': msg['MID'],
+                    'key': msg['key'],
+                    'value': msg['value'],
+                    'prevIndex': msg['prevIndex']
+                }
+                self.send(commit_msg)
+            else:
+                # we need to backtrack and update the log accordingly
+                commit_msg = {
+                    'src': self.id,
+                    'dst': self.leader,
+                    'leader': self.leader,
+                    'type': 'commit',
+                    'MID': msg['MID'],
+                    'key': msg['key'],
+                    'value': msg['value'],
+                    'prevIndex': msg['prevIndex']
+                }
+                self.send(commit_msg)
 
     def elect(self):
         print("{} is requesting to be new leader".format(self.id), flush=True)
@@ -136,14 +245,10 @@ class Replica:
                 self.state = "FOLLOWER"
                 self.vote_count = 0
         elif msg['type'] == 'append_entries':
-            # naive implementation
-            # doesn't do anything, we have to implement consensus, and checking the logs and sending commit messages
-            # commit_msg = {'src': self.id, 'dst': self.leader, 'leader': self.leader, 'type': 'commit', 'MID': msg['MID']}
-            # self.send(commit_msg)
-            pass
+            self.append_entries(msg)
         elif msg['type'] == 'commit':
             # here we check if a majority of replicas agree to commit
-            pass
+            self.commit_put(msg)
         elif msg['type'] == 'vote_request':
             if self.term < msg['term'] and self.state != "LEADER":  # if the term is higher, means they havent voted yet
                 self.vote_count = 0
